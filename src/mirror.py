@@ -72,6 +72,58 @@ def fit_image(img: Image.Image, tw: int, th: int, mode: str) -> Image.Image:
     return canvas
 
 
+def fit_mapper(sw: int, sh: int, tw: int, th: int, mode: str):
+    """返回把「源坐标」映射到「fit_image 之后坐标」的 (sx, sy, ox, oy)。
+
+    必须和 fit_image 的分支严格对应，否则光标位置会和画面错开。
+    """
+    if (sw, sh) == (tw, th):
+        return 1.0, 1.0, 0.0, 0.0
+    if mode == "stretch":
+        return tw / sw, th / sh, 0.0, 0.0
+    if mode == "crop":
+        scale = max(tw / sw, th / sh)
+        nw, nh = int(round(sw * scale)), int(round(sh * scale))
+        rw, rh = max(nw, tw), max(nh, th)
+        return scale, scale, -((rw - tw) // 2), -((rh - th) // 2)
+    scale = min(tw / sw, th / sh)
+    nw = max(1, int(round(sw * scale)))
+    nh = max(1, int(round(sh * scale)))
+    return scale, scale, (tw - nw) // 2, (th - nh) // 2
+
+
+def draw_cursor(img: Image.Image, region: dict, src_w: int, src_h: int,
+                tw: int, th: int, fit: str) -> None:
+    """把鼠标光标就地画到 img 上（原地修改）。
+
+    光标坐标是整屏坐标，先减掉抓取区域原点；不在区域内就不画。
+    """
+    try:
+        import cursor as cursor_mod
+        got = cursor_mod.get_cursor()
+        if not got:
+            return
+        cimg, hx, hy, cx, cy = got
+
+        rx = cx - region["left"]
+        ry = cy - region["top"]
+        if not (0 <= rx < src_w and 0 <= ry < src_h):
+            return                      # 光标不在抓取区域内
+
+        sx, sy, ox, oy = fit_mapper(src_w, src_h, tw, th, fit)
+        px = int(round(rx * sx + ox - hx * sx))
+        py = int(round(ry * sy + oy - hy * sy))
+
+        if sx != 1.0 or sy != 1.0:
+            nw = max(1, int(round(cimg.width * sx)))
+            nh = max(1, int(round(cimg.height * sy)))
+            cimg = cimg.resize((nw, nh), Image.BILINEAR)
+
+        img.paste(cimg, (px, py), cimg)
+    except Exception:
+        pass                            # 光标画不上不该影响推流
+
+
 def encode(img: Image.Image) -> bytes:
     for q in (85, 70, 55, 40):
         buf = io.BytesIO()
@@ -243,6 +295,10 @@ def main():
                     help="关掉变化检测，每帧都发（测速/放视频时用）")
     ap.add_argument("--panel", action="store_true",
                     help="在左上角叠加 462x462 信息面板（时间/天气/CPU/内存/GPU）")
+    ap.add_argument("--cursor", dest="cursor", action="store_true", default=True,
+                    help="把鼠标光标画进画面（默认开）")
+    ap.add_argument("--no-cursor", dest="cursor", action="store_false",
+                    help="不画鼠标光标")
     ap.add_argument("--dump-frame", metavar="PATH",
                     help="调试：把第 3 帧实际发出的画面存成 PNG")
     ap.add_argument("--rotate", type=int, default=0, choices=[0, 180],
@@ -339,6 +395,9 @@ def main():
                         img = panel.apply(img, provider.snapshot())
                     except Exception as e:
                         print("[warn] 面板渲染失败:", e)
+                if args.cursor:
+                    draw_cursor(img, region, raw.size[0], raw.size[1],
+                                tw, th, args.fit)
                 if args.rotate or args.flip != "none":
                     img = transform(img, args.rotate, args.flip)
                 sig = img.resize((48, 12), Image.BILINEAR).tobytes()

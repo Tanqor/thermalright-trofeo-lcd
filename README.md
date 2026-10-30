@@ -175,6 +175,18 @@ Windows 虚拟显示器 (usbmmidd, 1920×462)
 
 **限制**：24 fps 适合视频/监控/信息面板，**不适合游戏和鼠标精细操作**。
 
+### 鼠标光标
+
+`mss` / `BitBlt` 抓屏**不包含鼠标指针**（光标是独立的叠加层），所以默认会把光标
+自己画进画面，否则扩展屏上看不到鼠标。实现见 `src/cursor.py`：
+
+- 彩色光标：`GetIconInfo` + `DrawIconEx` 画到 32 位 DIB 再读像素
+- 单色光标：`hbmColor` 为空，`hbmMask` 是 AND/XOR 上下堆叠的双倍高掩码，自行解析
+- 白色光标会补一圈深色描边，避免在浅色壁纸上"消失"
+- 按 `hCursor` 缓存，连续 200 次调用 GDI 句柄零增长
+
+开关：`panel_config.json` 里 `"cursor": true|false`，或命令行 `--cursor` / `--no-cursor`。
+
 ---
 
 ## 手动运行 / 调试
@@ -259,6 +271,7 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveVirtualDisplay
 │   ├── trofeo.py            USB 协议层（握手/分块/发送/ACK/保活）
 │   ├── mirror.py            抓屏 → 编码 → 推流（双线程流水线）
 │   ├── panel.py             462×462 半透明卡片渲染
+│   ├── cursor.py            抓取并叠加鼠标光标（抓屏不含光标）
 │   ├── stats_provider.py    CPU/内存/显卡/定位/天气采集
 │   ├── extended_display.py  守护入口：确保虚拟屏 + supervisor 重启 + 方向变换
 │   ├── launcher.py          以管理员权限拉起守护进程（CPU 温度需要提权）

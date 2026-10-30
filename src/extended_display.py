@@ -30,6 +30,20 @@ FPS = "24"
 _ENABLEIDD_TRIED = False
 
 
+def show_cursor() -> bool:
+    """从 panel_config.json 读 cursor 开关（默认开）。
+
+    mss 抓屏不含光标，所以要自己画进去，否则扩展屏上看不到鼠标。
+    """
+    try:
+        import json
+        with open(paths.config_path(), encoding="utf-8") as f:
+            cfg = json.load(f)
+        return bool(cfg.get("cursor", True))
+    except Exception:
+        return True
+
+
 def screen_transform():
     """从 panel_config.json 读方向设置：rotate / flip。
 
@@ -263,6 +277,8 @@ def main():
             sys.argv = ["mirror.py", "--monitor", str(idx), "--fit", "stretch",
                         "--fps", FPS, "--panel",
                         "--rotate", str(rotate), "--flip", flip]
+            if not show_cursor():
+                sys.argv.append("--no-cursor")
             mirror.main()
             why = "正常退出"
         except KeyboardInterrupt:
