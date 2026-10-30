@@ -5,3 +5,6 @@ panel_config.json
 *.log
 *.png
 out/
+
+!docs/*.png
+!docs/*.gif

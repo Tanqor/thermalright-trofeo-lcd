@@ -6,6 +6,10 @@
 **完全不依赖官方 TRCC 软件**（那个 16 MB 的 WPF 程序）。协议是逆向 `USBLCDNEW.dll`
 的 `ThreadSendDeviceDataLY` 得到的。
 
+![预览](docs/preview.gif)
+
+> 静态大图：[`docs/preview.png`](docs/preview.png)
+
 ---
 
 ## 效果
@@ -212,6 +216,8 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveVirtualDisplay
 │   └── paths.py             路径解析（仓库布局 / 安装布局）
 ├── vdd/                     Amyuni usbmmidd 虚拟显示器驱动（见授权）
 ├── vendor/lhm/              LibreHardwareMonitorLib（读 CPU 温度）
+├── docs/                    预览图 / 演示 GIF
+├── tools/gen_preview.py     重新生成预览图与 GIF
 ├── setup.ps1 / uninstall.ps1
 ├── requirements.txt
 ├── config.example.json
