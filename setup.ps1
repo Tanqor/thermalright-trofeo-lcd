@@ -156,7 +156,8 @@ if ($NoTask) {
     $action  = New-ScheduledTaskAction -Execute $venvPyW -Argument "`"$(Join-Path $repo 'src\extended_display.py')`"" -WorkingDirectory $repo
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
-    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+    $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    # 兜底：进程若被杀/崩溃，计划任务会在 1 分钟后自动拉起
 
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $princ -Settings $set -Force `

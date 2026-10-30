@@ -130,11 +130,24 @@ def reverse_city(lat, lon):
 
 
 # ── 天气 ────────────────────────────────────────────────────────────
+def _http_json(url, tries=3, timeout=15):
+    """带重试的 JSON 请求。走代理的机器上偶发 SSL EOF，重试即可恢复。"""
+    last = None
+    for i in range(tries):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as r:
+                return json.load(r)
+        except Exception as e:            # noqa: BLE001
+            last = e
+            if i < tries - 1:
+                time.sleep(1.0 + i)
+    raise last
+
+
 def geocode(city: str):
     url = ("https://geocoding-api.open-meteo.com/v1/search"
            f"?name={urllib.parse.quote(city)}&count=1&language=zh&format=json")
-    with urllib.request.urlopen(url, timeout=15) as r:
-        js = json.load(r)
+    js = _http_json(url)
     res = (js.get("results") or [None])[0]
     if not res:
         raise RuntimeError("找不到城市: " + city)
@@ -146,8 +159,7 @@ def fetch_weather(lat, lon):
            f"?latitude={lat}&longitude={lon}"
            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code"
            "&timezone=auto")
-    with urllib.request.urlopen(url, timeout=15) as r:
-        js = json.load(r)
+    js = _http_json(url)
     cur = js.get("current") or {}
     code = int(cur.get("weather_code", -1))
     return {

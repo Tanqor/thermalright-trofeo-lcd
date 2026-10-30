@@ -4,5 +4,7 @@
   "lon": null,
   "use_system_location": true,
   "weather_minutes": 10,
-  "gpu_seconds": 2
+  "gpu_seconds": 2,
+  "rotate": 0,
+  "flip": "none"
 }

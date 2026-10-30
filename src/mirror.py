@@ -74,6 +74,25 @@ def encode(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def transform(img: Image.Image, rotate: int = 0, flip: str = "none") -> Image.Image:
+    """在编码前对整幅画面做方向变换。
+
+    物理面板的安装方向可能和图像不一致（倒装 / 反向），而 Windows 的
+    「显示方向」设置对这块屏无效——屏是直接接收 JPEG 显示的。
+    所以方向必须在发送前处理。
+
+    rotate: 0 或 180（90/270 会改变宽高比，与面板不符，不支持）
+    flip:   none / h（左右镜像）/ v（上下镜像）
+    """
+    if flip == "h":
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    elif flip == "v":
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    if rotate % 360 == 180:
+        img = img.rotate(180)
+    return img
+
+
 class Link:
     """带自动重连的发送端。"""
 
@@ -138,6 +157,10 @@ def main():
                     help="在左上角叠加 462x462 信息面板（时间/天气/CPU/内存/GPU）")
     ap.add_argument("--dump-frame", metavar="PATH",
                     help="调试：把第 3 帧实际发出的画面存成 PNG")
+    ap.add_argument("--rotate", type=int, default=0, choices=[0, 180],
+                    help="发送前旋转整幅画面：0 或 180（面板倒装时用 180）")
+    ap.add_argument("--flip", default="none", choices=["none", "h", "v"],
+                    help="发送前镜像：none/h(左右)/v(上下)")
     args = ap.parse_args()
 
     if args.fps > 30:
@@ -151,6 +174,11 @@ def main():
     sct = (mss.MSS if hasattr(mss, "MSS") else mss.mss)()
     region = grab_region(sct, args)
     print("截取区域:", region)
+
+    def new_sct():
+        return (mss.MSS if hasattr(mss, "MSS") else mss.mss)()
+
+    cap = {"sct": sct}
 
     period = 1.0 / max(1.0, args.fps)
     end = None if args.seconds == 0 else time.time() + args.seconds
@@ -175,6 +203,7 @@ def main():
     stats = {"sent": 0}
 
     def producer():
+        nonlocal region
         last_sig = None
         last_emit = 0.0
         try:
@@ -182,7 +211,25 @@ def main():
                 t0 = time.perf_counter()
                 if end is not None and time.time() >= end:
                     break
-                raw = sct.grab(region)
+                try:
+                    raw = cap["sct"].grab(region)
+                except Exception as e:
+                    # 常见于显示器配置变化 / 驱动重置 / 会话切换：
+                    # 重建 DXGI 抓屏上下文后继续，绝不让整个进程退出。
+                    print("[warn] 抓屏失败，重建抓屏上下文:", e)
+                    try:
+                        cap["sct"].close()
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    try:
+                        cap["sct"] = new_sct()
+                        region = grab_region(cap["sct"], args)
+                        print("[warn] 抓屏已恢复，区域:", region)
+                    except Exception as e2:
+                        print("[warn] 重建抓屏失败，稍后重试:", e2)
+                        time.sleep(1.0)
+                    continue
                 img = Image.frombytes("RGB", raw.size, raw.rgb)
                 img = fit_image(img, tw, th, args.fit)
                 if panel is not None:
@@ -190,6 +237,8 @@ def main():
                         img = panel.apply(img, provider.snapshot())
                     except Exception as e:
                         print("[warn] 面板渲染失败:", e)
+                if args.rotate or args.flip != "none":
+                    img = transform(img, args.rotate, args.flip)
                 sig = img.resize((48, 12), Image.BILINEAR).tobytes()
                 now = time.time()
                 changed = args.no_detect or sig != last_sig

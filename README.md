@@ -83,7 +83,9 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
   "lon": null,
   "use_system_location": true,
   "weather_minutes": 10,
-  "gpu_seconds": 2
+  "gpu_seconds": 2,
+  "rotate": 0,
+  "flip": "none"
 }
 ```
 
@@ -94,12 +96,42 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 | `lat` / `lon` | 直接指定经纬度（优先于 `city`） |
 | `weather_minutes` | 天气刷新间隔（分钟） |
 | `gpu_seconds` | 显卡数据刷新间隔（秒） |
+| `rotate` | 画面旋转：`0` 或 `180`。面板**倒装**时填 `180` |
+| `flip` | 画面镜像：`none` / `h`（左右）/ `v`（上下） |
 
 改完重启任务生效：
 
 ```powershell
 Stop-ScheduledTask TrofeoLCDMirror; Start-ScheduledTask TrofeoLCDMirror
 ```
+
+### 方向不对怎么办
+
+面板的物理安装方向可能和图像方向不一致（倒装、反向）。**Windows 的「显示方向」设置对它无效** ——
+这块屏不参与桌面渲染，只是「收到 JPEG 就原样显示」，所以方向必须在发送前处理。
+
+用校准工具判断该用哪种变换：
+
+```powershell
+Stop-ScheduledTask TrofeoLCDMirror
+.venv\Scripts\python.exe src\orient.py                    # 发送带方向标记的测试图
+.venv\Scripts\python.exe src\orient.py --rotate 180       # 试 180 度
+.venv\Scripts\python.exe src\orient.py --flip h           # 试左右镜像
+.venv\Scripts\python.exe src\orient.py --flip v           # 试上下镜像
+```
+
+测试图上：上边绿色「▲ 上 UP」，下边红色「▼ 下 DOWN」，左边蓝色「◀ 左 LEFT」，
+右边黄色「右 RIGHT ▶」，左上角一个白色方块。看哪个标记出现在哪边，就知道该填什么：
+
+| 你看到的 | 配置 |
+|---|---|
+| 上下颠倒（绿的在下面） | `"rotate": 180` |
+| 左右镜像（白方块跑到右上角） | `"flip": "h"` |
+| 颠倒 + 镜像 | `"rotate": 180, "flip": "h"` |
+| 全对 | 保持 `0` / `none` |
+
+> 注意：`rotate` 只支持 `0` / `180`。`90` / `270` 会改变宽高比（1920×462 → 462×1920），
+> 与面板不符，所以不支持。
 
 ---
 
@@ -172,7 +204,10 @@ Windows 虚拟显示器 (usbmmidd, 1920×462)
 | `--fit crop\|pad\|stretch` | 比例不符时：裁切填满 / 加黑边 / 拉伸 |
 | `--fps` | 目标帧率，硬件上限约 24 |
 | `--panel` | 叠加 462×462 信息面板 |
+| `--rotate 0\|180` | 发送前旋转整幅画面（面板倒装用 180） |
+| `--flip none\|h\|v` | 发送前镜像（左右 / 上下） |
 | `--no-detect` | 关掉变化检测，每帧必发 |
+| `--dump-frame PATH` | 把实际发出的画面存成 PNG（排查用） |
 
 ---
 
@@ -184,9 +219,20 @@ Windows 虚拟显示器 (usbmmidd, 1920×462)
 | 找不到 `0416:5408` | 屏幕没插好，或驱动不是 WinUSB（用 Zadig 装） |
 | 没有 1920×462 显示器 | 重跑 `setup.ps1`，或 `vdd\deviceinstaller64.exe enableidd 1` |
 | 卡片看不到 | 用 `--dump-frame` 抓帧确认；或屏幕比例不是 1920×462 |
+| **画面倒了 / 左右反了** | 见上文「方向不对怎么办」，改 `rotate` / `flip` |
 | CPU 温度显示 `--` | 需要管理员权限（LibreHardwareMonitor 要读 MSR）；确认任务"以最高权限运行" |
 | 天气一直"获取中" | 检查网络；系统定位需开启"设置 → 隐私和安全性 → 位置" |
 | 界面卡顿/低帧 | 属正常，24 fps 是硬件上限 |
+| 屏幕回 logo、守护进程消失 | 查日志是否有 `BitBlt` 报错。已内置抓屏自愈 + supervisor 重启 + 计划任务失败重启 |
+| 日志里 `ModuleNotFoundError: No module named 'paths'` | 部署时漏拷了 `paths.py`，把 `src\*.py` 全部同步过去 |
+
+### 已内置的稳定性机制
+
+这块屏需要**持续推流**（约 2–3 秒收不到帧就回 logo），所以守护进程必须长期活着。为此做了三层保护：
+
+1. **抓屏自愈**：`BitBlt` 等抓屏异常不退出，重建 DXGI 上下文后继续（长跑数小时后最容易碰上）
+2. **supervisor 循环**：镜像线程若仍异常退出，按 3s→30s 退避自动重启
+3. **计划任务兜底**：`RestartCount=999`，进程被杀或崩溃后 1 分钟自动拉起
 
 日志：`%LOCALAPPDATA%\TrofeoLCD\mirror.log`
 
@@ -212,7 +258,8 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveVirtualDisplay
 │   ├── mirror.py            抓屏 → 编码 → 推流（双线程流水线）
 │   ├── panel.py             462×462 半透明卡片渲染
 │   ├── stats_provider.py    CPU/内存/显卡/定位/天气采集
-│   ├── extended_display.py  守护入口：确保虚拟屏 + 启动镜像
+│   ├── extended_display.py  守护入口：确保虚拟屏 + supervisor 重启 + 方向变换
+│   ├── orient.py            方向校准工具（发测试图）
 │   └── paths.py             路径解析（仓库布局 / 安装布局）
 ├── vdd/                     Amyuni usbmmidd 虚拟显示器驱动（见授权）
 ├── vendor/lhm/              LibreHardwareMonitorLib（读 CPU 温度）

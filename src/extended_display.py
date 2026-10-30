@@ -26,6 +26,27 @@ TARGET_W, TARGET_H = 1920, 462
 FPS = "24"
 
 
+def screen_transform():
+    """从 panel_config.json 读方向设置：rotate / flip。
+
+    面板物理安装方向可能和图像不一致（倒装、反向），Windows 的显示方向
+    设置对这块屏无效，必须在发送前变换。
+    """
+    try:
+        import json
+        with open(paths.config_path(), encoding="utf-8") as f:
+            cfg = json.load(f)
+        rotate = int(cfg.get("rotate", 0) or 0)
+        flip = str(cfg.get("flip", "none") or "none").lower()
+    except Exception:
+        rotate, flip = 0, "none"
+    if rotate not in (0, 180):
+        rotate = 0
+    if flip not in ("none", "h", "v"):
+        flip = "none"
+    return rotate, flip
+
+
 # ── 日志 ────────────────────────────────────────────────────────────
 def setup_log():
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -162,22 +183,44 @@ def find_monitor_index():
 def main():
     log = setup_log()
     print("启动扩展屏服务")
-    ensure_virtual_display()
-    idx = find_monitor_index()
-    if idx is None:
-        print("没有找到 1920x462 的虚拟显示器，退出")
-        return 2
-    print(f"使用 mss monitor {idx}")
     sys.path.insert(0, HERE)
     import mirror
-    sys.argv = ["mirror.py", "--monitor", str(idx), "--fit", "stretch",
-                "--fps", FPS, "--panel"]
+
+    restarts = 0
+    while True:
+        try:
+            ensure_virtual_display()
+            idx = find_monitor_index()
+            if idx is None:
+                raise RuntimeError("没有找到 1920x462 的虚拟显示器")
+            print(f"使用 mss monitor {idx}")
+            rotate, flip = screen_transform()
+            if rotate or flip != "none":
+                print(f"方向变换: rotate={rotate} flip={flip}")
+            sys.argv = ["mirror.py", "--monitor", str(idx), "--fit", "stretch",
+                        "--fps", FPS, "--panel",
+                        "--rotate", str(rotate), "--flip", flip]
+            mirror.main()
+            why = "正常退出"
+        except KeyboardInterrupt:
+            print("收到中断，退出")
+            break
+        except BaseException as e:          # noqa: BLE001 — 守护进程必须活下去
+            why = f"异常 {type(e).__name__}: {e}"
+
+        restarts += 1
+        delay = min(30, 3 * restarts)
+        print(f"[supervisor] 镜像结束（{why}），{delay}s 后重启（第 {restarts} 次）")
+        try:
+            log.flush()
+        except Exception:
+            pass
+        time.sleep(delay)
+
     try:
-        mirror.main()
-    except KeyboardInterrupt:
-        pass
-    finally:
         log.flush()
+    except Exception:
+        pass
     return 0
 
 
