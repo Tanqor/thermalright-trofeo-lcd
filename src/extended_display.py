@@ -180,6 +180,52 @@ def find_monitor_index():
     return None
 
 
+def wait_capture_ready(timeout=90.0):
+    """等桌面抓屏真正可用，再开始推流。
+
+    开机时虚拟显示器的驱动/合成器可能比本服务晚就绪：EnumDisplayDevices 已经
+    报告显示器存在，但 BitBlt 仍会失败——实测开机瞬间连续失败 2028 次才恢复。
+    这里用一个真实抓屏试探，就绪后再启动镜像，避免开机阶段空转。
+
+    正常情况下第一次试探就成功，不会引入任何延迟。
+    """
+    import mss
+    cls = mss.MSS if hasattr(mss, "MSS") else mss.mss
+    t0 = time.time()
+    wait = 0.5
+    attempt = 0
+    while time.time() - t0 < timeout:
+        attempt += 1
+        sct = None
+        try:
+            sct = cls()
+            target = None
+            for i, m in enumerate(sct.monitors):
+                if i == 0:
+                    continue
+                if m["width"] == TARGET_W and m["height"] == TARGET_H:
+                    target = m
+                    break
+            if target is None:
+                raise RuntimeError("没找到 1920x462 显示器")
+            sct.grab({"left": target["left"], "top": target["top"],
+                      "width": target["width"], "height": target["height"]})
+            if attempt > 1:
+                print(f"抓屏就绪（等待 {time.time() - t0:.0f}s，试探 {attempt} 次）")
+            return True
+        except Exception:
+            time.sleep(wait)
+            wait = min(2.0, wait * 1.5)
+        finally:
+            if sct is not None:
+                try:
+                    sct.close()
+                except Exception:
+                    pass
+    print(f"警告：抓屏 {timeout:.0f}s 内未就绪，仍然继续启动")
+    return False
+
+
 def main():
     log = setup_log()
     print("启动扩展屏服务")
@@ -194,6 +240,7 @@ def main():
             if idx is None:
                 raise RuntimeError("没有找到 1920x462 的虚拟显示器")
             print(f"使用 mss monitor {idx}")
+            wait_capture_ready()
             rotate, flip = screen_transform()
             if rotate or flip != "none":
                 print(f"方向变换: rotate={rotate} flip={flip}")
