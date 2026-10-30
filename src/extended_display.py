@@ -1,0 +1,185 @@
+"""extended_display.py - 一键把机箱屏变成 Windows 扩展屏（开机自启入口）
+
+流程：
+  1. 确保 usbmmidd 虚拟显示器已启用，且分辨率是 1920x462
+  2. 找到那块虚拟屏在 mss 里的序号
+  3. 直接跑 mirror 循环，把虚拟屏内容推到机箱屏
+
+由计划任务在登录时以最高权限拉起（启用虚拟屏需要管理员）。
+"""
+from __future__ import annotations
+
+import ctypes
+import os
+import subprocess
+import sys
+import time
+
+import paths
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = paths.LOG_DIR
+LOG = paths.LOG_PATH
+DEVICEINSTALLER = os.path.join(paths.vdd_dir(), "deviceinstaller64.exe")
+
+TARGET_W, TARGET_H = 1920, 462
+FPS = "24"
+
+
+# ── 日志 ────────────────────────────────────────────────────────────
+def setup_log():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 2 * 1024 * 1024:
+            os.replace(LOG, LOG + ".1")
+    except Exception:
+        pass
+    f = open(LOG, "a", encoding="utf-8", buffering=1)
+    f.write("\n===== %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    sys.stdout = f
+    sys.stderr = f
+    return f
+
+
+# ── 虚拟显示器 ──────────────────────────────────────────────────────
+class DEVMODE(ctypes.Structure):
+    _fields_ = [
+        ("dmDeviceName", ctypes.c_wchar * 32),   # DEVMODEW：WCHAR[32] = 64 字节
+        ("dmSpecVersion", ctypes.c_ushort), ("dmDriverVersion", ctypes.c_ushort),
+        ("dmSize", ctypes.c_ushort), ("dmDriverExtra", ctypes.c_ushort),
+        ("dmFields", ctypes.c_ulong),
+        ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
+        ("dmDisplayOrientation", ctypes.c_ulong), ("dmDisplayFixedOutput", ctypes.c_ulong),
+        ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short), ("dmFormName", ctypes.c_wchar * 32),
+        ("dmLogPixels", ctypes.c_ushort), ("dmBitsPerPel", ctypes.c_ulong),
+        ("dmPelsWidth", ctypes.c_ulong), ("dmPelsHeight", ctypes.c_ulong),
+        ("dmDisplayFlags", ctypes.c_ulong), ("dmDisplayFrequency", ctypes.c_ulong),
+        ("dmICMMethod", ctypes.c_ulong), ("dmICMIntent", ctypes.c_ulong),
+        ("dmMediaType", ctypes.c_ulong), ("dmDitherType", ctypes.c_ulong),
+        ("dmReserved1", ctypes.c_ulong), ("dmReserved2", ctypes.c_ulong),
+        ("dmPanningWidth", ctypes.c_ulong), ("dmPanningHeight", ctypes.c_ulong),
+    ]
+
+
+DM_PELSWIDTH = 0x00080000
+DM_PELSHEIGHT = 0x00100000
+CDS_UPDATEREGISTRY = 0x00000001
+
+
+class DISPLAY_DEVICE(ctypes.Structure):
+    _fields_ = [
+        ("cb", ctypes.c_ulong),
+        ("DeviceName", ctypes.c_wchar * 32),
+        ("DeviceString", ctypes.c_wchar * 128),
+        ("StateFlags", ctypes.c_ulong),
+        ("DeviceID", ctypes.c_wchar * 128),
+        ("DeviceKey", ctypes.c_wchar * 128),
+    ]
+
+
+def list_displays():
+    """返回 [(device_name, w, h, primary)]"""
+    user32 = ctypes.windll.user32
+    out = []
+    i = 0
+    while True:
+        dd = DISPLAY_DEVICE()
+        dd.cb = ctypes.sizeof(DISPLAY_DEVICE)
+        if not user32.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+            break
+        dm = DEVMODE()
+        dm.dmSize = ctypes.sizeof(DEVMODE)
+        if user32.EnumDisplaySettingsW(dd.DeviceName, -1, ctypes.byref(dm)):
+            out.append((dd.DeviceName, dm.dmPelsWidth, dm.dmPelsHeight,
+                        bool(dd.StateFlags & 0x4)))  # DISPLAY_DEVICE_PRIMARY_DEVICE = 0x4
+        i += 1
+    return out
+
+
+def ensure_virtual_display():
+    """确保存在一块 1920x462 的非主显示器。必要时启用 usbmmidd 并设置模式。"""
+    user32 = ctypes.windll.user32
+
+    def have_target():
+        return any(w == TARGET_W and h == TARGET_H and not prim
+                   for _, w, h, prim in list_displays())
+
+    if not have_target():
+        if os.path.exists(DEVICEINSTALLER):
+            print("启用虚拟显示器 enableidd 1 ...")
+            try:
+                subprocess.run([DEVICEINSTALLER, "enableidd", "1"], timeout=60,
+                               capture_output=True)
+            except Exception as e:
+                print("enableidd 失败:", e)
+            time.sleep(5)
+        else:
+            print("找不到", DEVICEINSTALLER)
+
+    if have_target():
+        print("虚拟屏已就绪 1920x462")
+        return True
+
+    # 启用了但模式不对：挑一块非主显示器设成 1920x462
+    for name, w, h, prim in list_displays():
+        if prim:
+            continue
+        dm = DEVMODE()
+        dm.dmSize = ctypes.sizeof(DEVMODE)
+        ok = False
+        idx = 0
+        while user32.EnumDisplaySettingsW(name, idx, ctypes.byref(dm)):
+            if dm.dmPelsWidth == TARGET_W and dm.dmPelsHeight == TARGET_H:
+                ok = True
+                break
+            idx += 1
+        if not ok:
+            continue
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+        r = user32.ChangeDisplaySettingsExW(name, ctypes.byref(dm), None,
+                                            CDS_UPDATEREGISTRY, None)
+        print(f"设置 {name} -> {TARGET_W}x{TARGET_H} 返回 {r}")
+        time.sleep(2)
+        if have_target():
+            return True
+    print("警告：没能把虚拟屏设成 1920x462")
+    return False
+
+
+def find_monitor_index():
+    import mss
+    sct = (mss.MSS if hasattr(mss, "MSS") else mss.mss)()
+    for i, m in enumerate(sct.monitors):
+        if i == 0:
+            continue
+        if m["width"] == TARGET_W and m["height"] == TARGET_H:
+            return i
+    return None
+
+
+def main():
+    log = setup_log()
+    print("启动扩展屏服务")
+    ensure_virtual_display()
+    idx = find_monitor_index()
+    if idx is None:
+        print("没有找到 1920x462 的虚拟显示器，退出")
+        return 2
+    print(f"使用 mss monitor {idx}")
+    sys.path.insert(0, HERE)
+    import mirror
+    sys.argv = ["mirror.py", "--monitor", str(idx), "--fit", "stretch",
+                "--fps", FPS, "--panel"]
+    try:
+        mirror.main()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
