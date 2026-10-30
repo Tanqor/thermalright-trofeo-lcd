@@ -6,5 +6,6 @@
   "weather_minutes": 10,
   "gpu_seconds": 2,
   "rotate": 0,
-  "flip": "none"
+  "flip": "none",
+  "cursor": true
 }

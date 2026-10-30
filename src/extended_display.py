@@ -37,7 +37,7 @@ def show_cursor() -> bool:
     """
     try:
         import json
-        with open(paths.config_path(), encoding="utf-8") as f:
+        with open(paths.config_path(), encoding="utf-8-sig") as f:
             cfg = json.load(f)
         return bool(cfg.get("cursor", True))
     except Exception:
@@ -52,12 +52,18 @@ def screen_transform():
     """
     try:
         import json
-        with open(paths.config_path(), encoding="utf-8") as f:
+        with open(paths.config_path(), encoding="utf-8-sig") as f:
             cfg = json.load(f)
         rotate = int(cfg.get("rotate", 0) or 0)
         flip = str(cfg.get("flip", "none") or "none").lower()
-    except Exception:
+    except FileNotFoundError:
+        print("[warn] 没找到 panel_config.json，方向按 rotate=0 flip=none 处理")
         rotate, flip = 0, "none"
+    except Exception as e:
+        # 千万别静默回落：配置文件读不出来（比如被写成带 BOM 的 UTF-8）会
+        # 让画面方向突然反过来，这里必须留下线索。
+        print(f"[warn] 读 panel_config.json 失败（{type(e).__name__}: {e}），"
+              f"方向按 rotate=0 flip=none 处理")
     if rotate not in (0, 180):
         rotate = 0
     if flip not in ("none", "h", "v"):

@@ -57,7 +57,7 @@ def load_cfg():
     cfg = dict(DEFAULT_CFG)
     if os.path.exists(CFG_PATH):
         try:
-            with open(CFG_PATH, "r", encoding="utf-8") as f:
+            with open(CFG_PATH, "r", encoding="utf-8-sig") as f:
                 cfg.update(json.load(f) or {})
         except Exception:
             pass
