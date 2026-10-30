@@ -25,6 +25,10 @@ DEVICEINSTALLER = os.path.join(paths.vdd_dir(), "deviceinstaller64.exe")
 TARGET_W, TARGET_H = 1920, 462
 FPS = "24"
 
+# usbmmidd 的 enableidd 1 每调用一次就新增一块虚拟屏（最多 4 块），
+# 守护进程会反复重启，所以整个进程生命周期内只允许尝试一次。
+_ENABLEIDD_TRIED = False
+
 
 def screen_transform():
     """从 panel_config.json 读方向设置：rotate / flip。
@@ -120,7 +124,16 @@ def list_displays():
 
 
 def ensure_virtual_display():
-    """确保存在一块 1920x462 的非主显示器。必要时启用 usbmmidd 并设置模式。"""
+    """确保存在一块 1920x462 的非主显示器。必要时启用 usbmmidd 并设置模式。
+
+    注意：usbmmidd v2 的 `enableidd 1` 不是幂等的——每执行一次就新增一块虚拟
+    显示器，最多 4 块。守护进程会无限重启，如果每次都调用它，几轮下来就会把
+    4 块全用满（实测发生过：桌面多出 3 块 1920x1080 的虚拟屏）。
+    因此这里加两道保险：
+      1. 每个进程生命周期内最多调用一次 enableidd；
+      2. 若已存在多余的虚拟显示器，先清掉多余的，只留 462 那块。
+    """
+    global _ENABLEIDD_TRIED
     user32 = ctypes.windll.user32
 
     def have_target():
@@ -128,7 +141,10 @@ def ensure_virtual_display():
                    for _, w, h, prim in list_displays())
 
     if not have_target():
-        if os.path.exists(DEVICEINSTALLER):
+        if _ENABLEIDD_TRIED:
+            print("虚拟屏缺失，但本进程已尝试过 enableidd，跳过以免重复新增")
+        elif os.path.exists(DEVICEINSTALLER):
+            _ENABLEIDD_TRIED = True
             print("启用虚拟显示器 enableidd 1 ...")
             try:
                 subprocess.run([DEVICEINSTALLER, "enableidd", "1"], timeout=60,

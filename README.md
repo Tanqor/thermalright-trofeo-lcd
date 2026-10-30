@@ -218,9 +218,11 @@ Windows 虚拟显示器 (usbmmidd, 1920×462)
 | `Access denied (insufficient permissions)` | 设备被别的程序占用，关掉 TRCC/USBLCDNEW.exe |
 | 找不到 `0416:5408` | 屏幕没插好，或驱动不是 WinUSB（用 Zadig 装） |
 | 没有 1920×462 显示器 | 重跑 `setup.ps1`，或 `vdd\deviceinstaller64.exe enableidd 1` |
+| **多出好几块虚拟显示器** | `enableidd 1` 是"新增"而非"启用"，每跑一次多一块（最多 4 块）。用 `deviceinstaller64.exe enableidd 0` 逐块删掉多余的。守护进程已内置防重复新增 |
 | 卡片看不到 | 用 `--dump-frame` 抓帧确认；或屏幕比例不是 1920×462 |
 | **画面倒了 / 左右反了** | 见上文「方向不对怎么办」，改 `rotate` / `flip` |
-| CPU 温度显示 `--` | 需要管理员权限（LibreHardwareMonitor 要读 MSR）；确认任务"以最高权限运行" |
+| CPU 温度显示 `--` | 需要管理员权限（LibreHardwareMonitor 要读 MSR）；确认任务"以最高权限运行"，且任务动作指向 `launcher.py` 而非 `extended_display.py` |
+| **CPU 温度恒为 `0°C`** | 传感器库太旧。AMD Zen 5（如 9800X3D）需要 LibreHardwareMonitor ≥ 0.9.6；本仓库 `vendor/lhm/` 已含 0.9.6 及全部依赖 DLL，**不要只拷 `LibreHardwareMonitorLib.dll`**，否则会因缺 `System.Memory` 而初始化失败 |
 | 天气一直"获取中" | 检查网络；系统定位需开启"设置 → 隐私和安全性 → 位置" |
 | 界面卡顿/低帧 | 属正常，24 fps 是硬件上限 |
 | 屏幕回 logo、守护进程消失 | 查日志是否有 `BitBlt` 报错。已内置抓屏自愈 + supervisor 重启 + 计划任务失败重启 |
@@ -259,10 +261,11 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveVirtualDisplay
 │   ├── panel.py             462×462 半透明卡片渲染
 │   ├── stats_provider.py    CPU/内存/显卡/定位/天气采集
 │   ├── extended_display.py  守护入口：确保虚拟屏 + supervisor 重启 + 方向变换
+│   ├── launcher.py          以管理员权限拉起守护进程（CPU 温度需要提权）
 │   ├── orient.py            方向校准工具（发测试图）
 │   └── paths.py             路径解析（仓库布局 / 安装布局）
 ├── vdd/                     Amyuni usbmmidd 虚拟显示器驱动（见授权）
-├── vendor/lhm/              LibreHardwareMonitorLib（读 CPU 温度）
+├── vendor/lhm/              LibreHardwareMonitor 0.9.6 全套 DLL（读 CPU 温度）
 ├── docs/                    预览图 / 演示 GIF
 ├── tools/gen_preview.py     重新生成预览图与 GIF
 ├── setup.ps1 / uninstall.ps1

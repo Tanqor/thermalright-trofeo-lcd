@@ -153,7 +153,9 @@ if ($NoTask) {
     Write-Host "  $venvPy `"$repo\src\extended_display.py`""
 } else {
     Step "注册计划任务 $TaskName"
-    $action  = New-ScheduledTaskAction -Execute $venvPyW -Argument "`"$(Join-Path $repo 'src\extended_display.py')`"" -WorkingDirectory $repo
+    # 走 launcher.py：它确保守护进程拿到管理员令牌，否则 AMD 平台的 CPU 温度
+    # 读不到（Tctl/Tdie 必须通过 ring0 内核驱动读取，LHM 需要提权）。
+    $action  = New-ScheduledTaskAction -Execute $venvPyW -Argument "`"$(Join-Path $repo 'src\launcher.py')`"" -WorkingDirectory $repo
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
     $princ   = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable

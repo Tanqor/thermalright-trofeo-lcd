@@ -209,6 +209,28 @@ def grab_region(sct, args):
     return mons[idx]
 
 
+def refresh_region(sct, args, current):
+    """按显示器序号取当前坐标；位置没变就返回原对象。
+
+    显示器位置会在用户拖动「显示设置」后变化，而抓屏本身仍然成功——此时
+    grab_region 不会因异常被重新调用，守护进程就会一直抓旧坐标（表现为
+    画面内容错位/抓到的是一块空白区）。每帧核对一次，坐标变了立刻跟上。
+    """
+    if args.region:
+        return current
+    idx = args.monitor
+    mons = sct.monitors
+    if idx >= len(mons):
+        return current
+    live = mons[idx]
+    if (live["left"], live["top"], live["width"], live["height"]) == (
+            current["left"], current["top"], current["width"], current["height"]):
+        return current
+    print(f"[{ts()}] [warn] 显示器位置变化，更新区域: "
+          f"({current['left']},{current['top']}) -> ({live['left']},{live['top']})")
+    return live
+
+
 def main():
     ap = argparse.ArgumentParser(description="把屏幕内容推到机箱屏")
     ap.add_argument("--monitor", type=int, default=1, help="mss 显示器序号，1=主屏")
@@ -280,6 +302,7 @@ def main():
                 if end is not None and time.time() >= end:
                     break
                 try:
+                    region = refresh_region(cap["sct"], args, region)
                     raw = cap["sct"].grab(region)
                     if fails:
                         print(f"[{ts()}] [warn] 抓屏恢复正常（连续失败 {fails} 次后）")
