@@ -74,6 +74,11 @@ def encode(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def ts() -> str:
+    """日志时间戳，便于把告警和系统事件（休眠/分辨率变化）对齐。"""
+    return time.strftime("%H:%M:%S")
+
+
 def transform(img: Image.Image, rotate: int = 0, flip: str = "none") -> Image.Image:
     """在编码前对整幅画面做方向变换。
 
@@ -206,6 +211,8 @@ def main():
         nonlocal region
         last_sig = None
         last_emit = 0.0
+        fails = 0                 # 连续抓屏失败次数
+        total_fails = 0           # 累计失败次数（排查用）
         try:
             while not slot["stop"]:
                 t0 = time.perf_counter()
@@ -213,21 +220,26 @@ def main():
                     break
                 try:
                     raw = cap["sct"].grab(region)
+                    if fails:
+                        print(f"[{ts()}] [warn] 抓屏恢复正常（连续失败 {fails} 次后）")
+                        fails = 0
                 except Exception as e:
-                    # 常见于显示器配置变化 / 驱动重置 / 会话切换：
-                    # 重建 DXGI 抓屏上下文后继续，绝不让整个进程退出。
-                    print("[warn] 抓屏失败，重建抓屏上下文:", e)
+                    # 常见于显示器配置变化 / 驱动重置 / 会话切换 / 显示休眠。
+                    # 立即重建 DXGI 抓屏上下文，不等待——等待会造成可见卡顿。
+                    fails += 1
+                    total_fails += 1
+                    print(f"[{ts()}] [warn] 抓屏失败(第 {fails} 次/累计 {total_fails} 次)，重建抓屏上下文:", e)
                     try:
                         cap["sct"].close()
                     except Exception:
                         pass
-                    time.sleep(0.5)
                     try:
                         cap["sct"] = new_sct()
                         region = grab_region(cap["sct"], args)
-                        print("[warn] 抓屏已恢复，区域:", region)
+                        print(f"[{ts()}] [warn] 抓屏上下文已重建，区域: {region['width']}x{region['height']}")
+                        continue          # 立即重试，不 sleep
                     except Exception as e2:
-                        print("[warn] 重建抓屏失败，稍后重试:", e2)
+                        print(f"[{ts()}] [warn] 重建失败，1s 后重试:", e2)
                         time.sleep(1.0)
                     continue
                 img = Image.frombytes("RGB", raw.size, raw.rgb)
@@ -314,9 +326,9 @@ def main():
     finally:
         dur = time.time() - t_start
         sent = stats["sent"]
-        print(f"\n已发送 {sent} 帧，用时 {dur:.1f}s，平均 {sent/max(dur,1e-9):.1f} fps")
+        print(f"\n[{ts()}] 已发送 {sent} 帧，用时 {dur:.1f}s，平均 {sent/max(dur,1e-9):.1f} fps")
         if slot["error"]:
-            print("错误:", slot["error"])
+            print(f"[{ts()}] 错误:", slot["error"])
         if provider is not None:
             try:
                 provider.stop()

@@ -210,7 +210,8 @@ def main():
 
         restarts += 1
         delay = min(30, 3 * restarts)
-        print(f"[supervisor] 镜像结束（{why}），{delay}s 后重启（第 {restarts} 次）")
+        print(f"[{time.strftime('%H:%M:%S')}] [supervisor] 镜像结束（{why}），"
+              f"{delay}s 后重启（第 {restarts} 次）")
         try:
             log.flush()
         except Exception:
