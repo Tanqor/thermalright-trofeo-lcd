@@ -38,6 +38,7 @@ import mss
 from PIL import Image
 
 import trofeo
+import winmon
 
 MAX_JPEG = 440_000
 KEEPALIVE_S = 1.5
@@ -279,42 +280,124 @@ class Link:
             self.sending_since = 0.0
 
 
-def grab_region(sct, args):
+def parse_size(spec):
+    """把 "1920x462" 解析成 (1920, 462)；spec 为空返回 None。"""
+    if not spec:
+        return None
+    try:
+        w, h = spec.lower().replace(" ", "").split("x")
+        return int(w), int(h)
+    except Exception:
+        return None
+
+
+def find_monitor_by_size(mons, w, h, near=None):
+    """在所有显示器里找尺寸恰好是 w×h 的那块，返回 mss 序号。
+
+    mss 的 monitors[0] 是"所有屏幕的并集"，必须从 1 开始找。
+    为什么不直接用序号：用户一改「显示设置」里的排列顺序，Windows 枚举
+    顺序会变，写死的序号就可能指到别块屏上（抓到的内容就错了）。
+    虚拟屏的分辨率 1920×462 是唯一的，按尺寸找更稳。
+
+    正常只有一块 1920×462，但万一出现多块同尺寸（例如手动加过第二块
+    虚拟屏），优先选离 near 坐标最近的那块，避免在两块屏之间反复横跳。
+    """
+    hits = [i for i in range(1, len(mons))
+            if mons[i].get("width") == w and mons[i].get("height") == h]
+    if not hits:
+        return None
+    if len(hits) == 1 or near is None:
+        return hits[0]
+
+    def dist(i):
+        m = mons[i]
+        return abs(m["left"] - near["left"]) + abs(m["top"] - near["top"])
+
+    return min(hits, key=dist)
+
+
+def probe_monitors():
+    """实时枚举显示器（[并集, 各屏...]，与 mss 的 sct.monitors 同构）。
+
+    为什么不用 sct.monitors：mss 的 monitors 列表在 MSS() 构造时就缓存了，
+    整个对象生命周期内不会更新。用户一改「显示设置」，拿到的永远是旧坐标
+    （实测：同一 sct 对象移动副屏后仍报旧位置，只有新建 MSS 才反映新值）。
+    守护进程是长期运行的，所以每次直接问 Windows。
+    """
+    try:
+        return winmon.monitor_list()
+    except Exception as e:
+        print(f"[{ts()}] [warn] 枚举显示器失败: {e}")
+        return []
+
+
+def grab_region(sct, args, mons=None):
     if args.region:
         l, t_, w, h = (int(v) for v in args.region.split(","))
-        return {"left": l, "top": t_, "width": w, "height": h}
+        return dict(left=l, top=t_, width=w, height=h)
+    if mons is None:
+        mons = probe_monitors()
+    size = parse_size(getattr(args, "target_size", None))
+    if size:
+        idx = find_monitor_by_size(mons, *size)
+        if idx is None:
+            raise SystemExit(f"没找到 {size[0]}x{size[1]} 的显示器")
+        args.monitor = idx          # 记住解析结果，便于日志和回退
+        return mons[idx]
     idx = args.monitor
-    mons = sct.monitors
     if idx >= len(mons):
         raise SystemExit(f"没有第 {idx} 块屏（共 {len(mons)-1} 块）")
     return mons[idx]
 
 
 def refresh_region(sct, args, current):
-    """按显示器序号取当前坐标；位置没变就返回原对象。
+    """每帧核对目标屏的坐标/序号，变了就更新。返回 (region, 是否变化)。
 
-    显示器位置会在用户拖动「显示设置」后变化，而抓屏本身仍然成功——此时
-    grab_region 不会因异常被重新调用，守护进程就会一直抓旧坐标（表现为
-    画面内容错位/抓到的是一块空白区）。每帧核对一次，坐标变了立刻跟上。
+    用户在「显示设置」里拖动副屏后会发生两件事：
+      1. 坐标变了 —— 抓屏本身仍成功，不重新读就会一直抓旧区域，画面错位；
+      2. mss 的显示器序号可能变 —— 按序号抓会抓到别块屏上。
+    两种情况都在这里兜住：优先按分辨率重新定位，再比对坐标。
+    返回 changed=True 时调用方应主动重连 USB——改布局常常同时让 WinUSB
+    句柄静默失效，提前重连比等看门狗超时快得多，用户几乎感觉不到中断。
     """
     if args.region:
-        return current
-    idx = args.monitor
-    mons = sct.monitors
-    if idx >= len(mons):
-        return current
+        return current, False
+    mons = probe_monitors()
+    if not mons:
+        return current, False
+    size = parse_size(getattr(args, "target_size", None))
+    changed = False
+
+    if size:
+        idx = find_monitor_by_size(mons, *size, near=current)
+        if idx is None:
+            return current, False   # 目标屏暂时不可见，保持当前区域，下一帧再试
+        if idx != args.monitor:
+            print(f"[{ts()}] [warn] 显示器序号变化 {args.monitor} -> {idx}"
+                  f"（显示设置被改动），已按 {size[0]}x{size[1]} 重新定位")
+            args.monitor = idx
+            changed = True
+    else:
+        idx = args.monitor
+        if idx >= len(mons):
+            return current, False
+
     live = mons[idx]
     if (live["left"], live["top"], live["width"], live["height"]) == (
             current["left"], current["top"], current["width"], current["height"]):
-        return current
+        return current, changed
+
     print(f"[{ts()}] [warn] 显示器位置变化，更新区域: "
           f"({current['left']},{current['top']}) -> ({live['left']},{live['top']})")
-    return live
+    return live, True
 
 
 def main():
     ap = argparse.ArgumentParser(description="把屏幕内容推到机箱屏")
     ap.add_argument("--monitor", type=int, default=1, help="mss 显示器序号，1=主屏")
+    ap.add_argument("--target-size", metavar="WxH",
+                    help="按分辨率定位目标屏（如 1920x462）。比 --monitor 序号更稳："
+                         "改显示设置导致枚举顺序变化时仍能找对屏")
     ap.add_argument("--region", help="截取区域 左,上,宽,高")
     ap.add_argument("--fit", choices=["crop", "pad", "stretch"], default="crop")
     ap.add_argument("--fps", type=float, default=24.0)
@@ -387,7 +470,10 @@ def main():
                 if end is not None and time.time() >= end:
                     break
                 try:
-                    region = refresh_region(cap["sct"], args, region)
+                    region, layout_changed = refresh_region(cap["sct"], args, region)
+                    if layout_changed:
+                        # 改显示设置常让 WinUSB 句柄静默失效，主动重连一次
+                        link.suspect("显示器布局变化")
                     raw = cap["sct"].grab(region)
                     if fails:
                         print(f"[{ts()}] [warn] 抓屏恢复正常（连续失败 {fails} 次后）")

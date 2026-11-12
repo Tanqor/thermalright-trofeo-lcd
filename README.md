@@ -135,11 +135,34 @@ Stop-ScheduledTask TrofeoLCDMirror
 
 ---
 
+## 改显示设置不影响投屏
+
+在 Windows「显示设置」里拖动副屏位置、改排列顺序，守护进程会自动跟上，
+**不需要重启**。每帧都会重新定位一次目标屏：
+
+- **按分辨率定位**（`--target-size 1920x462`），不写死 mss 序号。
+  改排列后 Windows 的显示器枚举顺序会变，写死序号可能指到别块屏上。
+- **坐标实时读**：不用 `sct.monitors` —— mss 的显示器列表在 `MSS()`
+  构造时就缓存了，整个对象生命周期内都不更新，拿到的永远是旧坐标。
+  改用 `winmon.monitor_list()` 每次直接问 Windows。
+- **主动重连 USB**：改布局常常同时让 WinUSB 句柄静默失效（写入不报错但
+  数据进不到屏里）。检测到布局变化就立刻标记重连，不用等看门狗超时，
+  用户几乎看不到中断。
+
+实测日志（守护进程运行中连续移动副屏）：
+```
+[01:12:00] [warn] 显示器位置变化，更新区域: (0,1080) -> (1920,0)
+[01:12:00] [warn] 疑似连接失效（显示器布局变化），下次发送前重连
+[01:12:04] [warn] 显示器位置变化，更新区域: (1920,0) -> (-1920,0)
+[01:12:08] [warn] 显示器位置变化，更新区域: (-1920,0) -> (0,1080)
+```
+
+---
+
 ## 工作原理
 
 ```
-Windows 虚拟显示器 (usbmmidd, 1920×462)
-        │  DXGI/GDI 抓屏
+Windows 虚拟显示器 (usbmmidd, 1920×462)        │  DXGI/GDI 抓屏
         ▼
    mirror.py  ── 抓屏 → 缩放 → 叠加面板 → JPEG 编码
         │           （双线程流水线：抓屏/编码 ∥ USB 发送）
@@ -272,6 +295,7 @@ powershell -ExecutionPolicy Bypass -File uninstall.ps1 -RemoveVirtualDisplay
 │   ├── mirror.py            抓屏 → 编码 → 推流（双线程流水线）
 │   ├── panel.py             462×462 半透明卡片渲染
 │   ├── cursor.py            抓取并叠加鼠标光标（抓屏不含光标）
+│   ├── winmon.py            实时枚举显示器坐标（mss 的列表会缓存）
 │   ├── stats_provider.py    CPU/内存/显卡/定位/天气采集
 │   ├── extended_display.py  守护入口：确保虚拟屏 + supervisor 重启 + 方向变换
 │   ├── launcher.py          以管理员权限拉起守护进程（CPU 温度需要提权）

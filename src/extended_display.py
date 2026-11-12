@@ -317,7 +317,9 @@ def main():
             rotate, flip = screen_transform()
             if rotate or flip != "none":
                 print(f"方向变换: rotate={rotate} flip={flip}")
-            sys.argv = ["mirror.py", "--monitor", str(idx), "--fit", "stretch",
+            sys.argv = ["mirror.py", "--monitor", str(idx),
+                        "--target-size", f"{TARGET_W}x{TARGET_H}",
+                        "--fit", "stretch",
                         "--fps", FPS, "--panel",
                         "--rotate", str(rotate), "--flip", flip]
             if not show_cursor():
