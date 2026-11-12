@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import io
+import os
 import sys
 import threading
 import time
@@ -47,6 +48,15 @@ IDLE_PERIOD = 0.2   # 画面静止时的抓屏间隔（秒）
 SEND_STUCK_S = 3.0    # 单帧发送超过这个时长就认为卡住（正常单帧约 40ms）
 SEND_IDLE_S = 5.0     # 连续这么久没有成功发送，且生产者仍在出帧，就重置连接
 WATCHDOG_TICK_S = 1.0
+RESET_QUIET_S = 4.0   # 两次重置之间的最小间隔，避免日志每秒钟刷一遍
+
+# 兜底自愈：如果长时间一次都没发送成功，说明进程内部状态已坏（实测遇到过
+# 跑两天后每 5 秒一轮「重置→发成 1 帧→再卡」的死循环，屏幕因此一直黑着）。
+# 距上次成功发送超过 HARD_FAIL_WINDOW_S 且持续 HARD_FAIL_GRACE_S 仍未恢复，
+# 就退出进程让计划任务重启一个干净的新进程。
+HARD_FAIL_WINDOW_S = 15.0    # 多久没发成功才进入"疑似坏掉"状态
+HARD_FAIL_GRACE_S = 10.0     # 进入该状态后再观察多久才判定为真的坏掉
+EXIT_CODE_FATAL_USB = 75     # EX_TEMPFAIL，便于日后在任务历史里辨认
 
 
 def fit_image(img: Image.Image, tw: int, th: int, mode: str) -> Image.Image:
@@ -138,6 +148,20 @@ def ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def log_flush() -> None:
+    """把缓冲的日志刷到磁盘。
+
+    os._exit() 不会走正常的解释器关闭流程，不主动 flush 的话最后几条日志
+    （尤其是退出原因）会丢。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.flush()
+        except Exception:
+            pass
+
+
 def transform(img: Image.Image, rotate: int = 0, flip: str = "none") -> Image.Image:
     """在编码前对整幅画面做方向变换。
 
@@ -168,7 +192,8 @@ class Link:
         self.t = None
         self._lock = threading.Lock()
         self.sending_since = 0.0   # >0 表示正在发一帧，值是开始时间
-        self.last_ok = time.time()  # 最后一次成功发出的时间
+        self.last_ok = time.time()  # 最后一次成功发出的时间（真正成功，不被重置刷新）
+        self.last_reset = 0.0       # 上次看门狗重置的时间，用于抑制重复告警
         self._need_reconnect = False
 
     def suspect(self, reason: str = ""):
@@ -199,7 +224,11 @@ class Link:
             t = self.t
             self.t = None
         self.sending_since = 0.0
-        self.last_ok = time.time()   # 重置观察窗口，避免看门狗每个 tick 重复触发
+        # 注意：这里不能刷新 last_ok。last_ok 的语义是「最后一次真正发成功
+        # 的时间」，自愈机制靠它判断"多久没成功过"。如果重置时把它刷新，
+        # 就会永远达不到失败阈值——实测注入持续失败时自愈完全不触发。
+        # 抑制重复告警改用单独的 last_reset 字段。
+        self.last_reset = time.time()
         if t is not None:
             try:
                 t.close()
@@ -440,8 +469,14 @@ def main():
         场景：改显示器位置/分辨率、驱动重置后，WinUSB 句柄会静默失效——写调用
         不报错但数据进不到屏里，画面永久冻结。生产者还在出帧，消费者也在"发"，
         靠异常检测不到，只能用时间判定。
+
+        兜底：如果长时间（HARD_FAIL_WINDOW_S）一直没有成功发送过，说明进程
+        内部状态已经坏了，光靠重连好不了。此时直接退出进程，让计划任务拉起
+        一个全新的进程——只有换进程才能真正把状态清干净。
+        判定用「距上次成功发送的时长」，而不是失败次数：失败快慢不定
+        （立即抛异常 vs 卡 timeout），数次数会漏判。
         """
-        resets = 0
+        hard_fail_at = 0.0      # 首次判定"疑似坏掉"的时间，0 表示未进入该状态
         while True:
             time.sleep(WATCHDOG_TICK_S)
             if slot["stop"]:
@@ -452,18 +487,35 @@ def main():
                 last_frame = slot.get("last_frame_time", 0.0)
             producing = (now - last_frame) < SEND_IDLE_S
             stuck_for = now - link.sending_since if link.sending_since else 0.0
-            if stuck_for > SEND_STUCK_S:
-                resets += 1
-                link.force_reset(f"单帧发送卡住 {stuck_for:.1f}s，第 {resets} 次")
-                continue
             idle_for = now - link.last_ok
-            if idle_for > SEND_IDLE_S and producing:
-                resets += 1
-                link.force_reset(f"已 {idle_for:.1f}s 没有成功发送，第 {resets} 次")
-                continue
-            if resets and idle_for < 2.0:
-                print(f"[{ts()}] [warn] 发送已恢复（看门狗重置 {resets} 次后）")
-                resets = 0
+            since_reset = now - link.last_reset if link.last_reset else 1e9
+
+            if stuck_for > SEND_STUCK_S:
+                if since_reset > RESET_QUIET_S:
+                    link.force_reset(f"单帧发送卡住 {stuck_for:.1f}s")
+            elif idle_for > SEND_IDLE_S and producing:
+                if since_reset > RESET_QUIET_S:
+                    link.force_reset(f"已 {idle_for:.1f}s 没有成功发送")
+            elif idle_for < 2.0 and hard_fail_at:
+                print(f"[{ts()}] [warn] 发送已恢复（持续失败 "
+                      f"{now - hard_fail_at:.0f}s 后）")
+                hard_fail_at = 0.0
+
+            # ── 兜底：持续这么久一次都没发成功，认定进程状态已坏 ──
+            if idle_for >= HARD_FAIL_WINDOW_S and producing:
+                if not hard_fail_at:
+                    hard_fail_at = now      # 开始计时，再给一个窗口期
+                elif now - hard_fail_at >= HARD_FAIL_GRACE_S:
+                    print(f"[{ts()}] [fatal] 已 {now - hard_fail_at:.0f}s "
+                          f"持续无法发送（累计 {idle_for:.0f}s 未成功），"
+                          f"进程状态已损坏，退出等待计划任务重启")
+                    try:
+                        log_flush()
+                    except Exception:
+                        pass
+                    # 用 _exit 直接结束整个进程，避免在进程内被 supervisor
+                    # 立刻拉起——那条路径会保留坏状态。计划任务会重启新进程。
+                    os._exit(EXIT_CODE_FATAL_USB)
 
     def consumer():
         # USB 写是硬实时路径：给它更高线程优先级，避免抓屏/编码线程抢占

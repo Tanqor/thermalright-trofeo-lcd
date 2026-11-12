@@ -143,15 +143,49 @@ def list_displays():
     return out
 
 
+def _enable_stamp_path() -> str:
+    return os.path.join(paths.LOG_DIR, "last_enableidd.txt")
+
+
+def _enableidd_cooldown_ok(min_seconds: float = 300.0) -> bool:
+    """跨进程冷却：距离上次 enableidd 不足 min_seconds 就不要再调用。
+
+    `_ENABLEIDD_TRIED` 只是进程内变量，而守护进程会被计划任务反复重启
+    （看门狗自愈、崩溃重启）。如果在虚拟屏尚未枚举出来的窗口里每个新进程
+    都调一次 enableidd，几轮下来就会堆出多块虚拟屏——这在实际使用中真的
+    发生过。用文件记录上次调用时间，把冷却期跨进程延续下去。
+    """
+    try:
+        with open(_enable_stamp_path(), encoding="utf-8") as f:
+            last = float(f.read().strip())
+        gap = time.time() - last
+        if gap < min_seconds:
+            print(f"上次 enableidd 距今仅 {gap:.0f}s（<{min_seconds:.0f}s），跳过以免重复新增")
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _stamp_enableidd() -> None:
+    try:
+        os.makedirs(paths.LOG_DIR, exist_ok=True)
+        with open(_enable_stamp_path(), "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
 def ensure_virtual_display():
     """确保存在一块 1920x462 的非主显示器。必要时启用 usbmmidd 并设置模式。
 
     注意：usbmmidd v2 的 `enableidd 1` 不是幂等的——每执行一次就新增一块虚拟
     显示器，最多 4 块。守护进程会无限重启，如果每次都调用它，几轮下来就会把
     4 块全用满（实测发生过：桌面多出 3 块 1920x1080 的虚拟屏）。
-    因此这里加两道保险：
+    因此这里加三道保险：
       1. 每个进程生命周期内最多调用一次 enableidd；
-      2. 若已存在多余的虚拟显示器，先清掉多余的，只留 462 那块。
+      2. 跨进程冷却，重启后的新进程也不会马上再调一次；
+      3. 若已存在多余的虚拟显示器，先清掉多余的，只留 462 那块。
     """
     global _ENABLEIDD_TRIED
     user32 = ctypes.windll.user32
@@ -163,8 +197,11 @@ def ensure_virtual_display():
     if not have_target():
         if _ENABLEIDD_TRIED:
             print("虚拟屏缺失，但本进程已尝试过 enableidd，跳过以免重复新增")
+        elif not _enableidd_cooldown_ok():
+            pass
         elif os.path.exists(DEVICEINSTALLER):
             _ENABLEIDD_TRIED = True
+            _stamp_enableidd()
             print("启用虚拟显示器 enableidd 1 ...")
             try:
                 subprocess.run([DEVICEINSTALLER, "enableidd", "1"], timeout=60,
@@ -301,6 +338,11 @@ def main():
             log.flush()
         except Exception:
             pass
+
+        # 短窗口内反复重启（例如 USB 持续异常）时，退避时间要够长，
+        # 避免快速重启循环：每次重启都会重新打开 USB 设备，太密反而更难恢复。
+        if restarts >= 5:
+            delay = max(delay, 60)
         time.sleep(delay)
 
     try:
