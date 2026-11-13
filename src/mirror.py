@@ -60,6 +60,15 @@ HARD_FAIL_GRACE_S = 10.0     # 进入该状态后再观察多久才判定为真�
 EXIT_CODE_FATAL_USB = 75     # EX_TEMPFAIL，便于日后在任务历史里辨认
 
 
+class LayoutMismatch(RuntimeError):
+    """目标屏尺寸/位置不再符合预期，需要上层去纠正显示模式。
+
+    单独用一个异常类型，是为了让推流循环能把它和"普通抓屏失败"区分开：
+    后者重建抓屏上下文原地重试即可，前者必须跳出去让 supervisor 处理，
+    否则会一直抓一块已经不存在的区域，画面静默冻住。
+    """
+
+
 def fit_image(img: Image.Image, tw: int, th: int, mode: str) -> Image.Image:
     if img.size == (tw, th):
         return img
@@ -341,12 +350,12 @@ def grab_region(sct, args, mons=None):
     if size:
         idx = find_monitor_by_size(mons, *size)
         if idx is None:
-            raise SystemExit(f"没找到 {size[0]}x{size[1]} 的显示器")
+            raise LayoutMismatch(f"没找到 {size[0]}x{size[1]} 的显示器")
         args.monitor = idx          # 记住解析结果，便于日志和回退
         return mons[idx]
     idx = args.monitor
     if idx >= len(mons):
-        raise SystemExit(f"没有第 {idx} 块屏（共 {len(mons)-1} 块）")
+        raise LayoutMismatch(f"没有第 {idx} 块屏（共 {len(mons)-1} 块）")
     return mons[idx]
 
 
@@ -371,7 +380,12 @@ def refresh_region(sct, args, current):
     if size:
         idx = find_monitor_by_size(mons, *size, near=current)
         if idx is None:
-            return current, False   # 目标屏暂时不可见，保持当前区域，下一帧再试
+            # 目标屏尺寸对不上了（用户在显示设置里改了方向/分辨率，
+            # 例如把 1920x462 改成纵向 462x1920）。这时候绝不能"保持原区域
+            # 继续抓"——那块区域已经不存在了，BitBlt 会静默返回无效内容，
+            # 画面就冻在黑屏上，日志也没有任何线索（实测过）。
+            # 返回 need_fix=True，让主循环去调 ensure_virtual_display() 纠正。
+            return current, False, True
         if idx != args.monitor:
             print(f"[{ts()}] [warn] 显示器序号变化 {args.monitor} -> {idx}"
                   f"（显示设置被改动），已按 {size[0]}x{size[1]} 重新定位")
@@ -380,16 +394,16 @@ def refresh_region(sct, args, current):
     else:
         idx = args.monitor
         if idx >= len(mons):
-            return current, False
+            return current, changed, True
 
     live = mons[idx]
     if (live["left"], live["top"], live["width"], live["height"]) == (
             current["left"], current["top"], current["width"], current["height"]):
-        return current, changed
+        return current, changed, False
 
     print(f"[{ts()}] [warn] 显示器位置变化，更新区域: "
           f"({current['left']},{current['top']}) -> ({live['left']},{live['top']})")
-    return live, True
+    return live, True, False
 
 
 def main():
@@ -470,7 +484,13 @@ def main():
                 if end is not None and time.time() >= end:
                     break
                 try:
-                    region, layout_changed = refresh_region(cap["sct"], args, region)
+                    region, layout_changed, need_fix = refresh_region(
+                        cap["sct"], args, region)
+                    if need_fix:
+                        # 目标屏尺寸对不上（多半是被改成纵向/别的分辨率）。
+                        # 必须跳出整个推流循环交给 supervisor 去纠正模式，
+                        # 不能走下面的"重建抓屏上下文"分支——那只会原地重试。
+                        raise LayoutMismatch("目标屏尺寸不再匹配，需要纠正显示模式")
                     if layout_changed:
                         # 改显示设置常让 WinUSB 句柄静默失效，主动重连一次
                         link.suspect("显示器布局变化")
@@ -478,6 +498,8 @@ def main():
                     if fails:
                         print(f"[{ts()}] [warn] 抓屏恢复正常（连续失败 {fails} 次后）")
                         fails = 0
+                except LayoutMismatch:
+                    raise                       # 交给 supervisor 去纠正显示模式
                 except Exception as e:
                     # 常见于显示器配置变化 / 驱动重置 / 会话切换 / 显示休眠。
                     # 立即重建 DXGI 抓屏上下文，不等待——等待会造成可见卡顿。
@@ -648,8 +670,9 @@ def main():
         dur = time.time() - t_start
         sent = stats["sent"]
         print(f"\n[{ts()}] 已发送 {sent} 帧，用时 {dur:.1f}s，平均 {sent/max(dur,1e-9):.1f} fps")
-        if slot["error"]:
-            print(f"[{ts()}] 错误:", slot["error"])
+        err = slot["error"]
+        if err is not None:
+            print(f"[{ts()}] 错误:", err)
         if provider is not None:
             try:
                 provider.stop()
@@ -659,6 +682,13 @@ def main():
             link.t.close()
         except Exception:
             pass
+
+    # LayoutMismatch 必须抛给上层（extended_display 的 supervisor），
+    # 让它去调用 ensure_virtual_display() 把显示模式纠正回来。
+    # 只打印不抛的话，supervisor 以为"正常退出"，会原样重启，
+    # 尺寸依旧不匹配，于是又立刻失败——表现就是画面卡住、日志还一片安静。
+    if isinstance(slot["error"], LayoutMismatch):
+        raise slot["error"]
 
 
 if __name__ == "__main__":

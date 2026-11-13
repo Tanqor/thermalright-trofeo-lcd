@@ -16,6 +16,7 @@ import sys
 import time
 
 import paths
+import winmon
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = paths.LOG_DIR
@@ -110,6 +111,8 @@ class DEVMODE(ctypes.Structure):
 
 DM_PELSWIDTH = 0x00080000
 DM_PELSHEIGHT = 0x00100000
+DM_DISPLAYORIENTATION = 0x00000080
+DMDO_DEFAULT = 0                       # 横向
 CDS_UPDATEREGISTRY = 0x00000001
 
 
@@ -176,6 +179,60 @@ def _stamp_enableidd() -> None:
         pass
 
 
+def _find_virtual_monitor():
+    """找那块「本来就是我们的虚拟屏、但当前分辨率/方向不对」的显示器。
+
+    返回 (设备名, 宽, 高) 或 None。
+    判据：非主屏，且宽或高等于 462（usbmmidd 的 462 高度是这块屏独有的，
+    改成纵向后变成 462x1920，宽变成 462 仍然能认出来）。
+    """
+    for d in winmon.list_displays():
+        if d["primary"]:
+            continue
+        if d["width"] == TARGET_H or d["height"] == TARGET_H:
+            return d["name"], d["width"], d["height"]
+    return None
+
+
+def _remove_extra_virtuals():
+    """把多余的虚拟显示器（usbmmidd 多启出来的）关掉，只留目标那块。
+
+    `enableidd 0` 每调一次删一块，删除顺序由驱动决定，所以每删一块都重新
+    检查，绝不把目标屏删掉。
+    """
+    exe = DEVICEINSTALLER
+    if not os.path.exists(exe):
+        return
+    for _ in range(3):                    # 最多 4 块，最多删 3 块
+        displays = winmon.list_displays()
+        target = [d for d in displays
+                  if not d["primary"] and d["width"] == TARGET_W
+                  and d["height"] == TARGET_H]
+        extras = [d for d in displays
+                  if not d["primary"] and d not in target]
+        if not extras:
+            return
+        print(f"发现 {len(extras)} 块多余虚拟屏，删除一块…")
+        try:
+            subprocess.run([exe, "enableidd", "0"], timeout=60, capture_output=True)
+        except Exception as e:
+            print("enableidd 0 失败:", e)
+            return
+        time.sleep(4)
+        if not [d for d in winmon.list_displays()
+                if not d["primary"] and d["width"] == TARGET_W
+                and d["height"] == TARGET_H]:
+            # 目标屏被删掉了，立刻补回
+            print("目标屏被误删，重新启用")
+            try:
+                subprocess.run([exe, "enableidd", "1"], timeout=60,
+                               capture_output=True)
+            except Exception:
+                pass
+            time.sleep(5)
+            return
+
+
 def ensure_virtual_display():
     """确保存在一块 1920x462 的非主显示器。必要时启用 usbmmidd 并设置模式。
 
@@ -195,7 +252,15 @@ def ensure_virtual_display():
                    for _, w, h, prim in list_displays())
 
     if not have_target():
-        if _ENABLEIDD_TRIED:
+        # 先判断"虚拟屏还在、只是模式不对" vs "虚拟屏根本没启用"。
+        # 前者（例如用户把显示方向改成纵向，分辨率变成 462x1920）绝对
+        # 不能再调 enableidd——那会新增一块虚拟屏。这种情况交给下面的
+        # "把某块非主显示器设成 1920x462" 去纠正即可。
+        virtual_present = _find_virtual_monitor()
+        if virtual_present:
+            print(f"虚拟屏存在但模式是 {virtual_present[1]}x{virtual_present[2]}，"
+                  f"尝试改回 {TARGET_W}x{TARGET_H} 横向")
+        elif _ENABLEIDD_TRIED:
             print("虚拟屏缺失，但本进程已尝试过 enableidd，跳过以免重复新增")
         elif not _enableidd_cooldown_ok():
             pass
@@ -220,37 +285,54 @@ def ensure_virtual_display():
     for name, w, h, prim in list_displays():
         if prim:
             continue
+        # 直接强制设回 1920x462 横向，不再先检查"模式列表里有没有这个模式"。
+        # 纵向状态下这块屏当前的模式是 462x1920，EnumDisplaySettings 里未必
+        # 列得出 1920x462，之前先检查再设置就永远走不到设置这一步（实测：
+        # 改纵向后守护进程一直报"没能把虚拟屏设成 1920x462"）。
         dm = DEVMODE()
         dm.dmSize = ctypes.sizeof(DEVMODE)
-        ok = False
-        idx = 0
-        while user32.EnumDisplaySettingsW(name, idx, ctypes.byref(dm)):
-            if dm.dmPelsWidth == TARGET_W and dm.dmPelsHeight == TARGET_H:
-                ok = True
-                break
-            idx += 1
-        if not ok:
-            continue
-        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT
+        user32.EnumDisplaySettingsW(name, -1, ctypes.byref(dm))
+        dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYORIENTATION
+        dm.dmPelsWidth = TARGET_W
+        dm.dmPelsHeight = TARGET_H
+        dm.dmDisplayOrientation = DMDO_DEFAULT      # 强制回横向
         r = user32.ChangeDisplaySettingsExW(name, ctypes.byref(dm), None,
                                             CDS_UPDATEREGISTRY, None)
-        print(f"设置 {name} -> {TARGET_W}x{TARGET_H} 返回 {r}")
+        print(f"设置 {name} -> {TARGET_W}x{TARGET_H} 横向 返回 {r}")
         time.sleep(2)
         if have_target():
             return True
     print("警告：没能把虚拟屏设成 1920x462")
     return False
 
-
 def find_monitor_index():
-    import mss
-    sct = (mss.MSS if hasattr(mss, "MSS") else mss.mss)()
-    for i, m in enumerate(sct.monitors):
-        if i == 0:
+    """返回目标虚拟屏在 mss monitor 里的序号。
+
+    必须用实时枚举：mss 的 sct.monitors 在 MSS() 构造时缓存，改显示设置
+    后不会更新，拿它永远找不到新状态。序号按"第几块非主显示器"推算——
+    mss 的 monitors[0] 是并集，后面各屏的顺序与 Windows 枚举顺序一致。
+    """
+    for i, d in enumerate(winmon.list_displays()):
+        if d["primary"]:
             continue
-        if m["width"] == TARGET_W and m["height"] == TARGET_H:
-            return i
+        if d["width"] == TARGET_W and d["height"] == TARGET_H:
+            # Windows 枚举里非主屏的顺序 == mss monitors 里的顺序
+            return _mss_index_of(d["name"])
     return None
+
+
+def _mss_index_of(device_name: str):
+    """把 \\\\.\\DISPLAY20 这种名字换算成 mss 的显示器序号。
+
+    mss 的 monitors 顺序与 EnumDisplayDevices 的顺序一致（monitors[0] 是
+    并集，所以要 +1）。名字不稳定时不猜，直接按位置顺序兜底。
+    """
+    try:
+        disp = winmon.list_displays()
+        order = [d["name"] for d in disp]
+        return order.index(device_name) + 1
+    except Exception:
+        return None
 
 
 def wait_capture_ready(timeout=90.0):
@@ -306,12 +388,36 @@ def main():
     import mirror
 
     restarts = 0
+    missing = 0          # 连续找不到目标屏的次数
     while True:
         try:
             ensure_virtual_display()
+            # 兜底：万一 usbmmidd 被多启出了几块虚拟屏（enableidd 非幂等），
+            # 这里主动清掉多余的，只留 1920x462 那块。
+            try:
+                _remove_extra_virtuals()
+            except Exception as e:
+                print("清理多余虚拟屏失败:", e)
             idx = find_monitor_index()
             if idx is None:
-                raise RuntimeError("没有找到 1920x462 的虚拟显示器")
+                # 目标屏暂时不可用（例如用户刚在显示设置里改方向，驱动正在
+                # 重配；usbmmidd 其实不支持纵向，会短暂没有有效模式）。
+                # 这里不能立刻抛异常——那会触发 supervisor 每 3s 重启一次，
+                # 每次重启都要重开 USB 设备，用户看到的就是"卡死"。
+                # 改成原地等，等它自己回来。
+                missing += 1
+                if missing == 1 or missing % 10 == 0:
+                    print(f"[{time.strftime('%H:%M:%S')}] [warn] 暂时找不到 "
+                          f"{TARGET_W}x{TARGET_H} 虚拟屏（第 {missing} 次），"
+                          f"等待显示设置恢复…")
+                time.sleep(3)
+                if missing >= 40:        # 约 2 分钟仍没有，才交给 supervisor
+                    raise RuntimeError(
+                        f"连续 {missing} 次找不到 {TARGET_W}x{TARGET_H} 虚拟屏")
+                continue
+            if missing:
+                print(f"[{time.strftime('%H:%M:%S')}] 虚拟屏已恢复（等待了 {missing} 轮）")
+                missing = 0
             print(f"使用 mss monitor {idx}")
             wait_capture_ready()
             rotate, flip = screen_transform()
@@ -331,6 +437,17 @@ def main():
             break
         except BaseException as e:          # noqa: BLE001 — 守护进程必须活下去
             why = f"异常 {type(e).__name__}: {e}"
+            # 尺寸不匹配（多半是用户把显示方向改成纵向，分辨率变成 462x1920）
+            # 要立刻纠正，而且不该走退避——这是可恢复的配置问题，不是故障。
+            if type(e).__name__ == "LayoutMismatch":
+                print(f"[{time.strftime('%H:%M:%S')}] 显示模式不匹配，立即纠正")
+                try:
+                    ensure_virtual_display()
+                    _remove_extra_virtuals()
+                except Exception as e2:
+                    print("纠正失败:", e2)
+                restarts = 0        # 配置类问题不计入重启退避
+                continue
 
         restarts += 1
         delay = min(30, 3 * restarts)
